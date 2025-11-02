@@ -1,0 +1,214 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import yfinance as yf
+import pandas as pd
+from statsmodels.tsa.arima.model import ARIMA
+import joblib, os, requests, math
+from sklearn.metrics import mean_squared_error
+from datetime import datetime
+from sqlalchemy import create_engine, Column, String, Float, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+# ==========================================================
+# CONFIGURATION
+# ==========================================================
+app = FastAPI(title="Stock Forecast API", version="2.0")
+
+# APIs
+FINNHUB_API_KEY = "d41rpp1r01qreojnfr0gd41rpp1r01qreojnfr10"
+FINNHUB_URL = "https://finnhub.io/api/v1/quote"
+ALPHAVANTAGE_API_KEY = "demo"  # replace with your real API key
+ALPHAVANTAGE_URL = "https://www.alphavantage.co/query"
+
+# Enable CORS (Frontend Access)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==========================================================
+# DATABASE (SQLite)
+# ==========================================================
+DATABASE_URL = "sqlite:///./stocks.db"
+Base = declarative_base()
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+# Folder for saved models
+os.makedirs("models", exist_ok=True)
+
+class StockModel(Base):
+    __tablename__ = "stock_models"
+    symbol = Column(String, primary_key=True, index=True)
+    ma_file = Column(String)
+    arma_file = Column(String)
+    arima_file = Column(String)
+    rmse_ma = Column(Float)
+    rmse_arma = Column(Float)
+    rmse_arima = Column(Float)
+    last_trained = Column(DateTime, default=datetime.utcnow)
+
+
+Base.metadata.create_all(bind=engine)
+
+# ==========================================================
+# UTILITIES
+# ==========================================================
+def rmse(actual, predicted):
+    return math.sqrt(mean_squared_error(actual, predicted))
+
+
+def train_and_save_models(symbol: str):
+    """Train MA, ARMA, and ARIMA models and save them locally"""
+    df = yf.download(symbol, period="6mo", interval="1d")["Close"]
+
+    if df.empty:
+        raise HTTPException(status_code=404, detail="Invalid or unsupported stock symbol")
+
+    train = df[:-30]
+    test = df[-30:]
+
+    # Moving Average Model (MA)
+    ma_model = ARIMA(train, order=(0, 0, 1)).fit()
+    ma_pred = ma_model.forecast(steps=30)
+    ma_rmse = rmse(test, ma_pred)
+    ma_file = os.path.join("models", f"{symbol}_ma.pkl")
+    joblib.dump(ma_model, ma_file)
+
+    # ARMA Model
+    arma_model = ARIMA(train, order=(2, 0, 1)).fit()
+    arma_pred = arma_model.forecast(steps=30)
+    arma_rmse = rmse(test, arma_pred)
+    arma_file = os.path.join("models", f"{symbol}_arma.pkl")
+    joblib.dump(arma_model, arma_file)
+
+    # ARIMA Model
+    arima_model = ARIMA(train, order=(2, 1, 1)).fit()
+    arima_pred = arima_model.forecast(steps=30)
+    arima_rmse = rmse(test, arima_pred)
+    arima_file = os.path.join("models", f"{symbol}_arima.pkl")
+    joblib.dump(arima_model, arima_file)
+
+    # Save to DB
+    db = SessionLocal()
+    stock = StockModel(
+        symbol=symbol,
+        ma_file=ma_file,
+        arma_file=arma_file,
+        arima_file=arima_file,
+        rmse_ma=ma_rmse,
+        rmse_arma=arma_rmse,
+        rmse_arima=arima_rmse,
+        last_trained=datetime.utcnow(),
+    )
+    db.merge(stock)
+    db.commit()
+    db.close()
+
+    return ma_pred.tolist(), arma_pred.tolist(), arima_pred.tolist(), ma_rmse, arma_rmse, arima_rmse
+
+
+# ==========================================================
+# ENDPOINTS
+# ==========================================================
+@app.get("/")
+def root():
+    return {"message": "📊 Stock Forecast API is running!", "endpoints": ["/predict/{symbol}", "/realtime/{symbol}", "/stocks"]}
+
+
+@app.get("/predict/{symbol}")
+def predict(symbol: str):
+    """Predict stock prices using MA, ARMA, and ARIMA models"""
+    try:
+        symbol = symbol.upper()
+        db = SessionLocal()
+        record = db.query(StockModel).filter(StockModel.symbol == symbol).first()
+        db.close()
+
+        # If model not found in DB → Train and Save
+        if not record:
+            ma, arma, arima, r1, r2, r3 = train_and_save_models(symbol)
+        else:
+            ma_model = joblib.load(record.ma_file)
+            arma_model = joblib.load(record.arma_file)
+            arima_model = joblib.load(record.arima_file)
+            ma = ma_model.forecast(steps=30).tolist()
+            arma = arma_model.forecast(steps=30).tolist()
+            arima = arima_model.forecast(steps=30).tolist()
+            r1, r2, r3 = record.rmse_ma, record.rmse_arma, record.rmse_arima
+
+        return {
+            "symbol": symbol,
+            "MA_Prediction": ma,
+            "ARMA_Prediction": arma,
+            "ARIMA_Prediction": arima,
+            "RMSE": {"MA": r1, "ARMA": r2, "ARIMA": r3},
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/realtime/{symbol}")
+def get_realtime_price(symbol: str):
+    """Fetch real-time stock prices (Finnhub → AlphaVantage fallback)"""
+    symbol = symbol.upper()
+
+    # Finnhub
+    try:
+        res = requests.get(FINNHUB_URL, params={"symbol": symbol, "token": FINNHUB_API_KEY})
+        if res.status_code == 200:
+            data = res.json()
+            if "c" in data and data["c"] != 0:
+                return {
+                    "symbol": symbol,
+                    "source": "finnhub",
+                    "current": data["c"],
+                    "high": data["h"],
+                    "low": data["l"],
+                    "open": data["o"],
+                    "previous_close": data["pc"],
+                }
+    except Exception:
+        pass
+
+    # Alpha Vantage fallback
+    try:
+        res = requests.get(
+            ALPHAVANTAGE_URL,
+            params={"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": ALPHAVANTAGE_API_KEY},
+        )
+        data = res.json().get("Global Quote", {})
+        if "05. price" in data:
+            return {
+                "symbol": symbol,
+                "source": "alphavantage",
+                "current": float(data["05. price"]),
+                "high": None,
+                "low": None,
+                "open": float(data.get("02. open", 0)),
+                "previous_close": float(data.get("08. previous close", 0)),
+            }
+        raise HTTPException(status_code=404, detail="Stock not found on AlphaVantage")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Realtime API error: {str(e)}")
+
+
+@app.get("/stocks")
+def get_all_stocks():
+    """Get all stored stocks and their RMSE values"""
+    db = SessionLocal()
+    records = db.query(StockModel).all()
+    db.close()
+    return [
+        {
+            "symbol": r.symbol,
+            "rmse": {"MA": r.rmse_ma, "ARMA": r.rmse_arma, "ARIMA": r.rmse_arima},
+            "last_trained": r.last_trained,
+        }
+        for r in records
+    ]
